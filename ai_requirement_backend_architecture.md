@@ -1,208 +1,185 @@
-# 📐 AI Requirement Generation: Backend Architecture & Workflow Diagrams
+# 📐 Backend Architecture: `geminiService.ts` Deep Dive
 
-This document illustrates the end-to-end architecture, data flows, state machines, and code paths powering the **AI Requirement Generation** system in `ux_requirement_studio`.
+This document maps the exact, active implementation of **`services/geminiService.ts`** in `ux_requirement_studio`. It reflects the real code, functions, fallback pipelines, and invariants running in the application.
 
 ---
 
-## 1. End-to-End System Architecture
+## 1. End-to-End Service Architecture
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as User (Product Manager / Engineer)
     participant UI as WorkshopAssistant (RequirementDraftViews.tsx)
-    participant Service as GeminiService (geminiService.ts)
-    participant Config as Config Manager (/api/config)
+    participant GS as geminiService.ts (refineRequirementDraft)
+    participant CFG as Config Service (config.ts / componentSpecServices)
     participant Aura as Aura AI Proxy (/api-proxy/aura/v1)
-    participant Model as LLM (Gemini Model)
-    participant Editor as RequirementDraftEditor (Editor State)
+    participant LLM as Active Model (e.g. gemini-flash-latest)
 
-    User->>UI: Types request & clicks Send
-    UI->>UI: Append user message to chatHistory
-    UI->>Service: refineRequirementDraft(draftText, userInput, chatHistory, selectedType)
-    
+    UI->>GS: refineRequirementDraft(draft, userInput, history, selectedType)
+
     rect rgb(240, 245, 255)
-        note over Service: 1. Compute Context
-        Service->>Service: Count CLARIFICATION_QUESTIONS_ASKED from history (0 to 3)
-        Service->>Service: Slice last 6 messages to prevent context drift
-        Service->>Config: getFeatureRequestPromptTitle() ("USER_FEATURE_WRITER_HELPER")
-        Service->>Config: getAuraModel() (resolves active model, e.g. gemini-flash-latest)
-        Service->>Service: Construct payload with prompt, draft, checklist rules & JSON schema
+        note over GS: Step 1: Client & Config Resolution
+        GS->>GS: getAuraBaseUrl(): Check localhost vs .goog vs origin
+        GS->>GS: getAuraHeaders(): Add X-Component-Id (50), AppName, APP_CODE, X-Studio-Cookie
+        GS->>GS: getAuraClient(): Initialize OpenAI client (baseURL: /api-proxy/aura/v1)
+        GS->>CFG: getAuraModel(): GET /config/model (caches active model)
+        GS->>CFG: getFeatureRequestPromptTitle(): Resolve prompt title (e.g. USER_FEATURE_WRITER_HELPER)
     end
 
-    Service->>Aura: POST /chat/completions (OpenAI SDK client)
-    Aura->>Model: Forward prompt + system instruction
-    Model-->>Aura: Raw response string
-    Aura-->>Service: Raw response string
+    rect rgb(245, 250, 255)
+        note over GS: Step 2: History Slicing & State Preparation
+        GS->>GS: Calculate clarificationQuestionsAsked from history (checks state, phrases, & trailing '?')
+        GS->>GS: history.slice(-6): Keep only last 6 messages
+        GS->>GS: safeType = selectedType === 'Defect' ? 'Defect' : 'Feature'
+        GS->>GS: Construct messages: system (title), history (toOpenAiRole), user payload
+    end
+
+    GS->>Aura: openai.chat.completions.create(messages, { query: { k: '0' } })
+    Aura->>LLM: Forward to model with managed system instructions
+    LLM-->>Aura: Completion text
+    Aura-->>GS: choices[0].message.content
 
     rect rgb(245, 255, 240)
-        note over Service: 2. Parse & Invariant Guard
-        Service->>Service: parseJsonResponse(): Strip markdown fences (```json ... ```)
-        Service->>Service: Extract { state, reply, suggestedDraft, requirements }
-        Service->>Service: Enforce Guard Invariants (suggestedDraft null => requirements strictly null)
+        note over GS: Step 3: Parse, Fallbacks & Invariants
+        GS->>GS: parseJsonResponse(text, fallbackReplyKey=true)
+        GS->>GS: 1. Strip markdown fences (```json ... ```)
+        GS->>GS: 2. JSON.parse()
+        GS->>GS: 3. Greedy bracket extraction { ... } / [ ... ]
+        GS->>GS: 4. Fallback wrapping: { reply: text }
+        GS->>GS: Apply Draft Recovery Fallback (detects markdown user story in reply)
+        GS->>GS: Enforce State Invariant (cleanDraft != null => REQUIREMENT_READY)
+        GS->>GS: Normalize requirements array or parseMultiRequirementText(cleanDraft)
     end
 
-    Service-->>UI: Return { state, reply, suggestedDraft, requirements }
-
-    alt state == "CLARIFICATION_REQUIRED"
-        UI->>UI: Append AI reply with A/B/C options to chatHistory
-        note over Editor: Left editor untouched (draftText preserved)
-    else state == "MESSAGE_ONLY"
-        UI->>UI: Append AI advisory reply to chatHistory
-        note over Editor: Left editor untouched (draftText preserved)
-    else state == "REQUIREMENT_READY"
-        UI->>UI: Append confirmation reply to chatHistory
-        UI->>Editor: setDraftText(suggestedDraft) -> Updates editor markdown
-        alt Multiple requirements detected
-            UI->>Editor: setBrokenDownReqs() & setIsReviewingBreakdown(true)
-        end
-    end
+    GS-->>UI: Return { state, reply, suggestedDraft, requirements }
 ```
 
 ---
 
-## 2. Clarification State Machine & Decision Tree
+## 2. Actual State Machine in `refineRequirementDraft()`
 
-This diagram outlines how the model processes user input against the **6-Point Checklist** and the **3-Question Cap**:
+This flowchart depicts the real branching and guard invariants in `geminiService.ts` (lines 474–615):
 
 ```mermaid
 flowchart TD
-    Start([User sends chat message]) --> ParseInput[Analyze CURRENT DRAFT + USER INPUT + History]
+    Start([User sends chat message]) --> CountHistory["Calculate clarificationQuestionsAsked<br/>Counts model messages with:<br/>- state == 'CLARIFICATION_REQUIRED'<br/>- contains 'clarification needed'<br/>- ends with '?' (excluding acceptance criteria)"]
     
-    ParseInput --> CheckFunc{Are Points 1 to 5 satisfied?\n- Actor & Access\n- Context\n- Trigger\n- Action & Behavior\n- Functional Outcome}
+    CountHistory --> SliceHistory["Take recentHistory = history.slice(-6)"]
+    SliceHistory --> SendPrompt["Dispatch Prompt Payload to Aura Proxy with:<br/>CURRENT DRAFT<br/>SELECTED TYPE<br/>CLARIFICATION_QUESTIONS_ASKED<br/>USER INPUT"]
+    
+    SendPrompt --> ParseResponse["parseJsonResponse(text, fallbackReplyKey=true)"]
+    
+    ParseResponse --> CheckDraft{"Is suggestedDraft valid string?<br/>(not empty & not 'null')"}
 
-    CheckFunc -- YES --> ReqReady[State: REQUIREMENT_READY]
-    ReqReady --> GenDraft[Generate complete markdown in suggestedDraft]
-    GenDraft --> GenJSON[Populate requirements array with discrete items]
-    GenJSON --> ShortReply[Set reply to short confirmation: 'Requirement draft ready.']
-    GenJSON --> PopulateEditor([Editor populates on left side])
+    CheckDraft -- YES --> CleanDraftSet["cleanDraft = suggestedDraft.trim()"]
+    
+    CheckDraft -- NO --> ReplyFallback{"Does cleanReply contain complete draft structure?<br/>(User Story + Acceptance Criteria)<br/>AND is not a question"}
+    
+    ReplyFallback -- YES --> AdoptReply["cleanDraft = cleanReply.trim()<br/>cleanReply = 'Requirement draft ready.'<br/>finalState = 'REQUIREMENT_READY'"]
+    
+    ReplyFallback -- NO --> CleanDraftNull["cleanDraft = null"]
 
-    CheckFunc -- NO --> CountCheck{CLARIFICATION_QUESTIONS_ASKED < 3?}
+    CleanDraftSet --> ResolvedReady["resolvedState = 'REQUIREMENT_READY'"]
+    AdoptReady --> ResolvedReady
 
-    CountCheck -- YES --> ClarifyState[State: CLARIFICATION_REQUIRED]
-    ClarifyState --> NullDraft1[Set suggestedDraft: null\nSet requirements: null]
-    NullDraft1 --> AskQuestion[Formulate 1 targeted question on missing point]
-    AskQuestion --> ReplyFormat[Format reply with A/B/C options template]
-    ReplyFormat --> WaitUser([Wait for user answer in chat])
-    WaitUser --> Start
+    CleanDraftNull --> CheckFinalState{"finalState == 'CLARIFICATION_REQUIRED'?"}
+    CheckFinalState -- YES --> ResolvedClarify["resolvedState = 'CLARIFICATION_REQUIRED'"]
+    CheckFinalState -- NO --> ResolvedMsgOnly["resolvedState = 'MESSAGE_ONLY'"]
 
-    CountCheck -- NO --> MsgOnlyState[State: MESSAGE_ONLY]
-    MsgOnlyState --> NullDraft2[Set suggestedDraft: null\nSet requirements: null]
-    MsgOnlyState --> ExplainGaps[In reply: summarize what is understood & state missing functional items]
-    ExplainGaps --> Recovery[User provides missing details in follow-up]
-    Recovery --> ParseInput
+    ResolvedReady --> ExtractReqs{"Are parsed.requirements present?"}
+    ExtractReqs -- YES --> MapReqs["Map to Requirement objects (status: 'New', safeType)"]
+    ExtractReqs -- NO --> MultiCheck["parseMultiRequirementText(cleanDraft, safeType)"]
+    MultiCheck -- Multiple Reqs --> SplitReqs["normalizedReqs = split requirements"]
+    MultiCheck -- Single Req --> SingleReq["normalizedReqs = null (single draft)"]
+
+    ResolvedClarify --> ForceNullReqs["normalizedReqs = null (Strict Invariant)"]
+    ResolvedMsgOnly --> ForceNullReqs
+
+    MapReqs --> ReturnPayload([Return { state, reply, suggestedDraft, requirements }])
+    SplitReqs --> ReturnPayload
+    SingleReq --> ReturnPayload
+    ForceNullReqs --> ReturnPayload
 
     classDef ready fill:#d4edda,stroke:#28a745,stroke-width:2px;
     classDef clarify fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
     classDef msg fill:#e2e3e5,stroke:#6c757d,stroke-width:2px;
 
-    class ReqReady,GenDraft,GenJSON,PopulateEditor ready;
-    class ClarifyState,AskQuestion,ReplyFormat clarify;
-    class MsgOnlyState,ExplainGaps msg;
+    class ResolvedReady,AdoptReply,CleanDraftSet,MapReqs ready;
+    class ResolvedClarify,CheckFinalState clarify;
+    class ResolvedMsgOnly,ForceNullReqs msg;
 ```
 
 ---
 
-## 3. Two-Stage Delivery Pipeline (Writer AI ➔ Validator Agent ➔ Human Review)
+## 3. Resilient Parsing Pipeline (`parseJsonResponse`)
 
-This diagram shows how the generated output transitions across database entities and approval quality gates:
-
-```mermaid
-stateDiagram-v2
-    [*] --> DraftMode: User opens RequirementDraftEditor
-
-    state "Stage 1: Requirement Writer AI" as Stage1 {
-        DraftMode --> ChatClarification: Clarification rounds (1-3)
-        ChatClarification --> ReadyState: Points 1-5 satisfied
-        ReadyState --> SavedDatabase: User clicks 'Save'
-    }
-
-    state "Stage 2: Requirement Validator Agent" as Stage2 {
-        SavedDatabase --> StatusNew: Saved to DB with status = 'New'
-        StatusNew --> FetchMCP: Validator Agent calls getProjectRequirementById(id)
-        
-        state QualityGates <<choice>>
-        FetchMCP --> QualityGates: Audit against 6 Quality Gates
-        
-        QualityGates --> FailsGates: Ambiguous words / Missing criteria / No tangible output
-        FailsGates --> NeedsClarification: Status remains 'New'\nComment logged with deficiencies
-        
-        QualityGates --> PassesGates: All gates pass (Yes/No testable, 1-4 ACs, Zero ambiguity)
-        PassesGates --> StatusAIReviewed: Update status to 'AI Reviewed' via API
-    }
-
-    state "Stage 3: Team Review & Execution" as Stage3 {
-        StatusAIReviewed --> HumanReviewUnlocked: Review actions unlocked in UI
-        HumanReviewUnlocked --> InReview: Lead/Dev approves (status = 'Review')
-        InReview --> Approved: Status = 'Approved'
-        Approved --> InProgress: Status = 'In Progress'
-    }
-
-    NeedsClarification --> DraftMode: Author refines requirement
-```
-
----
-
-## 4. Acceptance Criteria Validation Architecture
-
-How the Writer AI's criteria are checked by the Validator Agent's Quality Gate:
+In `geminiService.ts` (lines 93–139), every AI response goes through a 4-tier parsing filter:
 
 ```mermaid
-graph TD
-    subgraph WriterAI ["Stage 1: Writer AI (new_user_feature_writer_helper.md)"]
-        W1[Bounded Count: 1 to 4 criteria]
-        W2[WHAT, Not HOW: No code/APIs/DB]
-        W3[Yes/No Assertions]
-        W4[Exhaustive Field Names: No 'data' or 'details']
-        W5[Coverage: Happy Path + State Change + Empty State]
-    end
+flowchart TD
+    Input[Raw LLM Text from Choices] --> EmptyCheck{Is text null, undefined, or empty?}
+    EmptyCheck -- YES --> FallbackReplyCheck{fallbackReplyKey == true?}
+    FallbackReplyCheck -- YES --> EmptyReply["Return { reply: 'I'm sorry, I couldn't generate a response...' }"]
+    FallbackReplyCheck -- NO --> EmptyArray["Return []"]
 
-    subgraph ValidatorAgent ["Stage 2: Validator Agent (requirement_validator_prompt.md)"]
-        V1{Criteria Count <= 4?}
-        V2{Any tech implementation details?}
-        V3{Can QA answer YES/NO without guessing?}
-        V4{Contains banned words: any, relevant, appropriate, etc.?}
-        V5{Is there tangible observable output?}
-    end
+    EmptyCheck -- NO --> Tier1["Tier 1: Strip Code Fences<br/>Regex match ```(?:json)?\s*([\s\S]*?)```"]
+    Tier1 --> Tier2{"Tier 2: Direct JSON.parse()"}
+    Tier2 -- Success --> ReturnParsed([Return parsed object])
+    
+    Tier2 -- Fails --> Tier3{"Tier 3: Greedy Substring Extraction<br/>Find min/max of '{' and '['<br/>Find matching last '}' or ']'"}
+    Tier3 -- Found Valid Substring --> ParseSub["JSON.parse(innerSubstring)"]
+    ParseSub -- Success --> ReturnParsed
+    
+    ParseSub -- Fails / Not Found --> Tier4{fallbackReplyKey == true?}
+    Tier4 -- YES --> WrapPlain["Tier 4: Wrap Plain Text<br/>Return { reply: text }"]
+    Tier4 -- NO --> ThrowError([Throw Error: 'AI response is not valid JSON'])
 
-    subgraph Verdict ["Verdict"]
-        Pass[Pass Quality Gate\nStatus -> 'AI Reviewed'\nScore: 9-10]
-        Fail[Fail Quality Gate\nRecommendation -> 'Needs Clarification'\nStatus remains 'New']
-    end
-
-    W1 --> V1
-    W2 --> V2
-    W3 --> V3
-    W4 --> V4
-    W5 --> V5
-
-    V1 -- No --> Fail
-    V2 -- Yes --> Fail
-    V3 -- No --> Fail
-    V4 -- Yes --> Fail
-    V5 -- No --> Fail
-
-    V1 -- Yes --> Pass
-    V2 -- No --> Pass
-    V3 -- Yes --> Pass
-    V4 -- No --> Pass
-    V5 -- Yes --> Pass
-
-    classDef pass fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    classDef success fill:#d4edda,stroke:#28a745,stroke-width:2px;
     classDef fail fill:#f8d7da,stroke:#dc3545,stroke-width:2px;
-    class Pass pass;
-    class Fail fail;
+    class ReturnParsed,WrapPlain success;
+    class ThrowError fail;
 ```
 
 ---
 
-## 5. Code Directory Reference
+## 4. Multi-Requirement Splitting (`parseMultiRequirementText`)
 
-| Component / Service | File Path | Role in Architecture |
-|---|---|---|
-| **Chat Panel UI** | [`components/RequirementDraftViews.tsx`](file:///d:/HIQ/ux_requirement_studio/components/RequirementDraftViews.tsx) | `WorkshopAssistant`: captures chat input, renders chat bubbles, sends turns. |
-| **Editor Container** | [`components/RequirementDraftEditor.tsx`](file:///d:/HIQ/ux_requirement_studio/components/RequirementDraftEditor.tsx) | Holds `draftText`, handles multi-requirement breakdown, attachment uploads, and save handler. |
-| **AI Service Engine** | [`services/geminiService.ts`](file:///d:/HIQ/ux_requirement_studio/services/geminiService.ts) | Implements `refineRequirementDraft`, manages Aura Proxy connection, JSON parsing, and guard invariants. |
-| **System Instruction** | [`new_user_feature_writer_helper.md`](file:///d:/HIQ/new_user_feature_writer_helper.md) | The production prompt template with XML tags, 6-point checklist, and validator compliance. |
-| **Validator Prompt** | [`requirement_validator_prompt.md`](file:///d:/HIQ/requirement_validator_prompt.md) | System prompt for the downstream quality auditor. |
-| **API Config & Endpoints**| [`services/appBuilder/config.ts`](file:///d:/HIQ/ux_requirement_studio/services/appBuilder/config.ts) | Base URLs for Proxy, Config Manager, and AI Studio Manager. |
+In `geminiService.ts` (lines 632–697), when the AI returns multiple requirements in a single draft:
+
+```mermaid
+flowchart TD
+    TextIn[Markdown Draft Text] --> DividerCheck{"Contains '---' markdown dividers?"}
+    
+    DividerCheck -- YES --> SplitDivider["Split by /(?:^|\n)\s*---\s*(?:\n|$)/"]
+    SplitDivider --> SectionsExist{Sections count > 1?}
+    SectionsExist -- YES --> ProcessSections["For each section:<br/>1. Extract title from line 1 (strip markdown '#')<br/>2. resolveExplicitType(sectionText)<br/>3. status: 'New', priority: 'Medium', category: 'User'"]
+    
+    DividerCheck -- NO --> PatternCheck{"Matches /(?:^|\n)(?:###?\s*)?Requirement\s+\d+[:\s]/gi?"}
+    SectionsExist -- NO --> PatternCheck
+
+    PatternCheck -- YES (Count > 1) --> MatchSplit["Slice text between match start and next match start"]
+    MatchSplit --> ProcessPattern["For each section:<br/>1. Clean title: strip 'Requirement N:'<br/>2. resolveExplicitType(sectionText)<br/>3. Return Requirement object"]
+
+    PatternCheck -- NO (<= 1) --> ReturnEmpty["Return [] (Treated as single requirement)"]
+
+    ProcessSections --> ReturnList([Return Requirement[] array])
+    ProcessPattern --> ReturnList
+    ReturnEmpty --> ReturnList
+```
+
+---
+
+## 5. Complete Function Map of `geminiService.ts`
+
+| Exported Function | Lines in Code | Prompt Key / Mechanism | Purpose |
+|---|---|---|---|
+| `refineRequirementDraft` | 452–619 | Dynamic via `getFeatureRequestPromptTitle()` | Interactive chat-based requirement authoring with 3-question limit and draft recovery. |
+| `getRequirementBreakdown` | 199–231 | `FEATURE_PLANNER` | Decomposes a parent requirement into child sub-requirements. |
+| `getComponentSpecBreakdown` | 238–296 | `getComponentSpecPromptTitle()` | Decomposes a requirement and maps each specification to an available `ProjectComponent.id`. |
+| `getRequirementsResponse` | 299–344 | `REQUIREMENTS_PRODUCT_OWNER` | Full-list requirements assistant supporting cancellation via `AbortSignal`. |
+| `getTaskResponse` | 346–391 | `REQUIREMENTS_PRODUCT_OWNER` | Task-level assistant supporting cancellation via `AbortSignal`. |
+| `parseRequirementsFromText` | 393–423 | `REQUIREMENTS_FROM_TEXT` | Ingests unstructured meeting notes or PRD text and extracts requirement objects. |
+| `generatePRD` | 425–450 | `PRD_FROM_REQUIREMENTS_GENERATOR` | Converts a structured JSON array of requirements into a complete PRD document. |
+| `breakdownDraftToRequirements` | 699–737 | `getAiBreakdownPromptTitle()` | Parses an editor draft into normalized `Requirement[]` objects. |
+| `parseMultiRequirementText` | 632–697 | Local regex parser (no LLM call) | Splits drafts containing `---` or `Requirement N:` into discrete requirements. |
+| `fetchPromptFromManager` | 190–197 | `getPromptByTitle(title)` | Helper to fetch prompt text directly from Prompt Manager API. |
